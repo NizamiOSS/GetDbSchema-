@@ -1,12 +1,4 @@
-USE [PerfCounters]
-GO
-
-/****** Object:  StoredProcedure [dbo].[GetDbSchemaV3]    Script Date: 5/2/2024 7:27:10 PM ******/
-SET ANSI_NULLS ON
-GO
-
-SET QUOTED_IDENTIFIER ON
-GO
+USE [master]
 
 
 
