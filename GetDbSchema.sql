@@ -1,23 +1,15 @@
-USE [PerfCounters]
-GO
-
-/****** Object:  StoredProcedure [dbo].[GetDbSchemaV3]    Script Date: 5/2/2024 7:27:10 PM ******/
-SET ANSI_NULLS ON
-GO
-
-SET QUOTED_IDENTIFIER ON
-GO
 
 
-
-CREATE PROCEDURE [dbo].[GetDbSchemaV3] @Database varchar(50) = NULL
+CREATE OR ALTER  PROCEDURE [dbo].[GetDbSchemaV] @Database varchar(50) = NULL
 
 AS
 
 BEGIN
 
 
-drop table if exists #tmp 
+/* create temp table to store final results */
+
+drop table if exists #tmp
 
 
 create table #tmp
@@ -33,14 +25,17 @@ create_date datetime
 
 
 
+/* start cursor to run the procedure on all required databases */
+
 declare @dbname varchar(50)
 
 declare @tsql nvarchar(max)
 
 DECLARE db_cursor CURSOR FOR
 
-   select  name from sys.databases
+   SELECT  name FROM sys.databases
    where database_id > 4 
+
 
 OPEN db_cursor;
 FETCH NEXT FROM db_cursor INTO @dbname;
@@ -48,13 +43,16 @@ WHILE @@FETCH_STATUS = 0
     BEGIN
         BEGIN TRY
 
-		 
-		 SET @tsql = 'use ['+@dbname+']
- 
-  
+
+         SET @tsql = 'use ['+@dbname+']
+
+/* create temporary tables */
+
 DROP TABLE IF EXISTS #filegroups;
 DROP TABLE IF EXISTS #tables;
-DROP TABLE IF EXISTS #indexes;
+DROP TABLE IF EXISTS #row_store_indexes;
+DROP TABLE IF EXISTS #col_store_indexes;
+DROP TABLE IF EXISTS #all_indexes;
 DROP TABLE IF EXISTS #create_dates;
 DROP TABLE IF EXISTS #altered;
 DROP TABLE IF EXISTS #result1;
@@ -62,31 +60,45 @@ DROP TABLE IF EXISTS #result2;
 
 
 CREATE TABLE #tables
-(table_name   NVARCHAR(100), 
+(table_name   NVARCHAR(100),
  create_table NVARCHAR(MAX)
 );
 
-CREATE TABLE #indexes
-(table_name   NVARCHAR(100), 
- index_name   NVARCHAR(100), 
+CREATE TABLE #row_store_indexes
+(table_name   NVARCHAR(100),
+ index_name   NVARCHAR(100),
  create_index NVARCHAR(MAX)
 );
 
 CREATE TABLE #altered
-(table_name   NVARCHAR(100), 
+(table_name   NVARCHAR(100),
  constraint_name   NVARCHAR(100),
  alter_table NVARCHAR(MAX)
 );
 
 
+CREATE TABLE #col_store_indexes
+(table_name   NVARCHAR(100),
+ index_name   NVARCHAR(100),
+ create_index NVARCHAR(MAX)
+);
+
+CREATE TABLE #all_indexes
+(table_name   NVARCHAR(100),
+ index_name   NVARCHAR(100),
+ create_index NVARCHAR(MAX)
+);
 
 
-  
-  insert into #tables
-  SELECT s.name + ''.'' + so.name, 
-              ''CREATE TABLE ['' + ''''+s.name+''''+''].['' + so.name + '']'' + ''('' + CHAR(10) + o.list + '')'' 
+
+
+/* #tables stores table name, schema name, table creation scripts of each table */
+
+  INSERT into #tables
+  SELECT s.name + ''.'' + so.name,
+              ''CREATE TABLE ['' + ''''+s.name+''''+''].['' + so.name + '']'' + ''('' + CHAR(10) + o.list + '')''
        FROM sys.objects so
-	   JOIN sys.schemas s on s.schema_id = so.schema_id
+       JOIN sys.schemas s on s.schema_id = so.schema_id
             CROSS APPLY
        (
            SELECT CHAR(9) + ''['' + column_name + ''] '' + ''['' + data_type + '']'' + CASE data_type
@@ -104,11 +116,15 @@ CREATE TABLE #altered
                                                                                                            ELSE CAST(character_maximum_length AS VARCHAR)
                                                                                                        END + '')'', '''')
                                                                                END + '' '' + CASE
-
-																							  
-                                                                                               WHEN (select columnproperty(object_id(s.name+''.''+so.name), column_name ,''IsIdentity'')) = 1
-                                                                                               THEN '' IDENTITY('' + CAST(IDENT_SEED(s.name+''.''+so.name) AS VARCHAR) + '','' + CAST(IDENT_INCR(s.name+''.''+so.name) AS VARCHAR) + '')''
-																						
+                                                                                               WHEN EXISTS
+           (
+               SELECT id
+               FROM syscolumns
+               WHERE OBJECT_NAME(id) = so.name
+                     AND name = column_name
+                     AND COLUMNPROPERTY(id, name, ''IsIdentity'') = 1
+           )
+                                                                                               THEN ''IDENTITY('' + CAST(IDENT_SEED(so.name) AS VARCHAR) + '','' + CAST(IDENT_INCR(so.name) AS VARCHAR) + '')''
                                                                                                ELSE ''''
                                                                                            END + '''' + (CASE
                                                                                                            WHEN IS_NULLABLE = ''No''
@@ -121,13 +137,11 @@ CREATE TABLE #altered
                                                                                                                        END + '','' + CHAR(10)
            FROM information_schema.columns
            WHERE table_name = so.name
-		   AND TABLE_SCHEMA = s.name
            ORDER BY ordinal_position FOR XML PATH('''')
        ) o(list)
             LEFT JOIN information_schema.table_constraints tc ON tc.Table_name = so.Name
                                                                  AND tc.Constraint_Type IN(''PRIMARY KEY'', ''UNIQUE'')
-																 
-		    
+
 
             CROSS APPLY
        (
@@ -143,11 +157,9 @@ CREATE TABLE #altered
 
 
 
-
-
-
-insert into #altered
-	    SELECT distinct s.name + ''.'' + so.name, tc.Constraint_Name, CASE
+/* #altered stores scripts with ALTER command for each table */
+INSERT into #altered
+        SELECT distinct s.name + ''.'' + so.name, tc.Constraint_Name, CASE
                                                                                                 WHEN tc.Constraint_Name IS NULL
                                                                                                 THEN ''''
                                                                                                 WHEN tc.Constraint_Type = ''PRIMARY KEY''
@@ -157,16 +169,12 @@ insert into #altered
                                                                                             END
 
 FROM sys.objects so
-	   JOIN sys.schemas s on s.schema_id = so.schema_id
+       JOIN sys.schemas s on s.schema_id = so.schema_id
 
-	   LEFT JOIN information_schema.table_constraints tc ON tc.Table_name = so.Name
-
-
+       LEFT JOIN information_schema.table_constraints tc ON tc.Table_name = so.Name
                                                                  AND tc.Constraint_Type IN(''PRIMARY KEY'', ''UNIQUE'')
 
-																 AND tc.TABLE_SCHEMA = s.name
-
-	   CROSS APPLY
+       CROSS APPLY
        (
            SELECT+CHAR(10) + CHAR(9) + ''['' + Column_Name + ''], ''
            FROM information_schema.key_column_usage kcu
@@ -210,8 +218,8 @@ FROM sys.objects so
                SELECT *
                FROM
                (
-                   SELECT IC2.object_id, 
-                          IC2.index_id, 
+                   SELECT IC2.object_id,
+                          IC2.index_id,
                           STUFF(
                    (
                        SELECT '','' + CHAR(9) + CHAR(10) + CHAR(9) + ''['' + C.name + CASE
@@ -225,13 +233,13 @@ FROM sys.objects so
                                                   AND IC1.is_included_column = 0
                        WHERE IC1.object_id = IC2.object_id
                              AND IC1.index_id = IC2.index_id
-                       GROUP BY IC1.object_id, 
-                                C.name, 
+                       GROUP BY IC1.object_id,
+                                C.name,
                                 index_id
                        ORDER BY MAX(IC1.key_ordinal) FOR XML PATH('''')
                    ), 1, 2, '''') KeyColumns
                    FROM sys.index_columns IC2
-                   GROUP BY IC2.object_id, 
+                   GROUP BY IC2.object_id,
                             IC2.index_id
                ) tmp3
            ) tmp4 ON I.object_id = tmp4.object_id
@@ -240,16 +248,19 @@ FROM sys.objects so
                                      AND ST.stats_id = I.index_id
                 JOIN sys.data_spaces DS ON I.data_space_id = DS.data_space_id
                 JOIN sys.filegroups FG ON I.data_space_id = FG.data_space_id
-                JOIN information_schema.table_constraints tc ON tc.TABLE_NAME = T.name	
-				
+                JOIN information_schema.table_constraints tc ON tc.TABLE_NAME = T.name
+
        ) c(list) where so.type_desc = ''USER_TABLE'';
-           
 
 
 
-INSERT INTO #indexes
-       SELECT s.name + ''.'' + T.name, 
-	          I.name,
+
+
+/* #row_store_indexes store creation scripts of rowstore indexes for each table */
+
+INSERT INTO #row_store_indexes
+       SELECT s.name + ''.'' + T.name,
+              I.name,
               ''CREATE '' + CASE
                               WHEN I.is_unique = 1
                               THEN ''UNIQUE ''
@@ -289,8 +300,8 @@ INSERT INTO #indexes
            SELECT *
            FROM
            (
-               SELECT IC2.object_id, 
-                      IC2.index_id, 
+               SELECT IC2.object_id,
+                      IC2.index_id,
                       STUFF(
                (
                    SELECT '','' + CHAR(9) + CHAR(10) + CHAR(9) + ''['' + C.name + CASE
@@ -304,13 +315,13 @@ INSERT INTO #indexes
                                               AND IC1.is_included_column = 0
                    WHERE IC1.object_id = IC2.object_id
                          AND IC1.index_id = IC2.index_id
-                   GROUP BY IC1.object_id, 
-                            C.name, 
+                   GROUP BY IC1.object_id,
+                            C.name,
                             index_id
                    ORDER BY MAX(IC1.key_ordinal) FOR XML PATH('''')
                ), 1, 2, '''') KeyColumns
                FROM sys.index_columns IC2
-               GROUP BY IC2.object_id, 
+               GROUP BY IC2.object_id,
                         IC2.index_id
            ) tmp3
        ) tmp4 ON I.object_id = tmp4.object_id
@@ -324,8 +335,8 @@ INSERT INTO #indexes
            SELECT *
            FROM
            (
-               SELECT IC2.object_id, 
-                      IC2.index_id, 
+               SELECT IC2.object_id,
+                      IC2.index_id,
                       STUFF(
                (
                    SELECT '','' + ''['' + C.name + '']''
@@ -335,115 +346,198 @@ INSERT INTO #indexes
                                               AND IC1.is_included_column = 1
                    WHERE IC1.object_id = IC2.object_id
                          AND IC1.index_id = IC2.index_id
-                   GROUP BY IC1.object_id, 
-                            C.name, 
+                   GROUP BY IC1.object_id,
+                            C.name,
                             index_id FOR XML PATH('''')
                ), 1, 2, '''') IncludedColumns
                FROM sys.index_columns IC2
-               GROUP BY IC2.object_id, 
+               GROUP BY IC2.object_id,
                         IC2.index_id
            ) tmp1
            WHERE IncludedColumns IS NOT NULL
        ) tmp2 ON tmp2.object_id = I.object_id
                  AND tmp2.index_id = I.index_id
-		JOIN  sys.schemas s on s.schema_id = T.schema_id
+        JOIN  sys.schemas s on s.schema_id = T.schema_id
        WHERE I.is_primary_key = 0
              AND I.is_unique_constraint = 0;
 
 
 
-SELECT s.name +''.'' + o.[name] table_name, 
-       o.[type] table_type, 
-       i.[name] index_name, 
-       i.[index_id], 
+
+/* #row_store_indexes store creation scripts of columnstore indexes for each table. If you don`t have columnstore indexes, no need to change the script, this part won`t return any results */
+
+INSERT INTO #col_store_indexes
+       SELECT s.name + ''.'' + T.name,
+              I.name,
+              ''CREATE ''+ I.type_desc COLLATE DATABASE_DEFAULT + '' INDEX '' + ''['' + I.name + '']'' + '' ON '' + ''['' + SCHEMA_NAME(T.schema_id) + '']'' + ''.'' + ''['' + T.name + '']'' + CHAR(10)  + ''WITH ('' +
+
+
+
+              CASE
+                  WHEN I.type = 5
+                  THEN ''DROP_EXISTING = OFF, COMPRESSION_DELAY = 0''
+
+                  END + '') ON ['' + DS.name + '']'' + '';'' [CreateIndexScript]
+       FROM sys.indexes I
+            JOIN sys.tables T ON T.object_id = I.object_id
+            JOIN sys.sysindexes SI ON I.object_id = SI.id
+                                      AND I.index_id = SI.indid
+
+            JOIN sys.data_spaces DS ON I.data_space_id = DS.data_space_id
+            JOIN sys.filegroups FG ON I.data_space_id = FG.data_space_id
+            LEFT JOIN
+       (
+           SELECT *
+           FROM
+           (
+               SELECT IC2.object_id,
+                      IC2.index_id,
+                      STUFF(
+               (
+                   SELECT '','' + ''['' + C.name + '']''
+                   FROM sys.index_columns IC1
+                        JOIN sys.columns C ON C.object_id = IC1.object_id
+                                              AND C.column_id = IC1.column_id
+                                              AND IC1.is_included_column = 1
+                   WHERE IC1.object_id = IC2.object_id
+                         AND IC1.index_id = IC2.index_id
+                   GROUP BY IC1.object_id,
+                            C.name,
+                            index_id FOR XML PATH('''')
+               ), 1, 2, '''') IncludedColumns
+               FROM sys.index_columns IC2
+               GROUP BY IC2.object_id,
+                        IC2.index_id
+           ) tmp1
+           WHERE IncludedColumns IS NOT NULL
+       ) tmp2 ON tmp2.object_id = I.object_id
+                 AND tmp2.index_id = I.index_id
+        JOIN  sys.schemas s on s.schema_id = T.schema_id
+       WHERE I.is_primary_key = 0
+             AND I.is_unique_constraint = 0;
+
+
+
+
+/* #filegroups stores filegroup name for each table and index */
+
+SELECT s.name +''.'' + o.[name] table_name,
+       o.[type] table_type,
+       i.[name] index_name,
+       i.[index_id],
        f.[name] file_name
 INTO #filegroups
 FROM sys.indexes i
      INNER JOIN sys.filegroups f ON i.data_space_id = f.data_space_id
      INNER JOIN sys.all_objects o ON i.[object_id] = o.[object_id]
-	 INNER JOIN sys.schemas s ON s.schema_id = o.schema_id
+     INNER JOIN sys.schemas s ON s.schema_id = o.schema_id
 WHERE i.data_space_id = f.data_space_id
       AND o.type = ''U'' -- User Created Tables
 ORDER BY f.name;
 
 
-SELECT S.NAME +''.'' + T.[name] AS [table_name], 
-       create_date, 
+/* #create_dates stores creation and modification dates for each table*/
+
+SELECT S.NAME +''.'' + T.[name] AS [table_name],
+       create_date,
        modify_date
 INTO #create_dates
 FROM sys.tables T
 INNER JOIN sys.schemas s ON s.schema_id = T.schema_id
 
 
+/* creating indexes table_name columns in order to speed up the JOINs*/
+
 CREATE NONCLUSTERED INDEX IX_table_name ON #tables(table_name);
-CREATE NONCLUSTERED INDEX IX_table_name ON #indexes(table_name);
+CREATE NONCLUSTERED INDEX IX_table_name ON #row_store_indexes(table_name);
 CREATE NONCLUSTERED INDEX IX_table_name ON #altered(table_name);
 
 
 
+/* elimination noise values on alter_table field */
+
 UPDATE #altered
-  SET 
+  SET
       alter_table = NULL
 WHERE alter_table NOT LIKE ''%ALTER%'';
 
 
+/* #result1 stores JOIN result of tables with corresponding alter script and outer applying the resuls with filegroup values*/
 
-	 SELECT  
+     SELECT
        DISTINCT
        DB_NAME() as [db_name],
        (t.table_name),
-       REPLACE(t.create_table, ''NULL,'' + CHAR(10) + '')'', ''NULL'' + CHAR(10) + '')'') + '' ON '' + ''['' + f.file_name + ''];'' AS create_table, 
-	   REPLACE(a.alter_table, ''NULL,'' + CHAR(10) + '')'', ''NULL'' + CHAR(10) + '')'') + '' ON '' + ''['' + f.file_name + ''];'' AS alter_table,
-	   c.create_date
+       REPLACE(t.create_table, ''NULL,'' + CHAR(10) + '')'', ''NULL'' + CHAR(10) + '')'') + '' ON '' + ''['' + f.file_name + ''];'' AS create_table,
+       REPLACE(a.alter_table, ''NULL,'' + CHAR(10) + '')'', ''NULL'' + CHAR(10) + '')'') + '' ON '' + ''['' + f.file_name + ''];'' AS alter_table,
+       c.create_date
 into #result1
 FROM #tables t
      LEFT JOIN #create_dates c on  t.table_name = c.table_name
      LEFT JOIN #altered a on t.table_name = a.table_name
 
-	 outer apply 
-	 (
-	 
-	  select top 1 * from #filegroups f 
-	  where t.table_name = f.table_name
+     outer apply
+     (
 
-	 ) f
+      SELECT top 1 * FROM #filegroups f
+      where t.table_name = f.table_name
+
+     ) f
 
 
 
-	   SELECT  
+
+/* #all_indexes combines result of both rowstore and columnstore indexes */
+
+     INSERT into #all_indexes
+     SELECT * FROM #row_store_indexes where create_index is not null
+     union
+     SELECT * FROM #col_store_indexes where create_index is not null
+
+
+
+
+
+
+/* #result2 stores JOIN result of tables and with all corresponding indexes, filegroup and tables` creation dates */
+
+
+       SELECT
        DISTINCT
        DB_NAME() as [db_name],
        (t.table_name),
 
-       REPLACE(t.create_table, ''NULL,'' + CHAR(10) + '')'', ''NULL'' + CHAR(10) + '')'') + '' ON '' + ''['' + f.file_name + ''];''  AS create_table, 
-	   REPLACE(i.create_index, ''NULL,'' + CHAR(10) + '')'', ''NULL'' + CHAR(10) + '')'')  AS create_index,
-	   c.create_date
+       REPLACE(t.create_table, ''NULL,'' + CHAR(10) + '')'', ''NULL'' + CHAR(10) + '')'') + '' ON '' + ''['' + f.file_name + ''];''  AS create_table,
+       REPLACE(i.create_index, ''NULL,'' + CHAR(10) + '')'', ''NULL'' + CHAR(10) + '')'')  AS create_index,
+       c.create_date
 into #result2
 FROM #tables t
      LEFT JOIN #create_dates c on  t.table_name = c.table_name
-     LEFT JOIN #indexes i on t.table_name = i.table_name
-	 outer apply 
-	 (
-	 
-	  select top 1 * from #filegroups f 
-	  where t.table_name = f.table_name
+     LEFT JOIN #all_indexes i on t.table_name = i.table_name
+     outer apply
+     (
 
-	 ) f
+      SELECT top 1 * FROM #filegroups f
+      where t.table_name = f.table_name
+
+     ) f
 
 
+/* above results are JOINed with ALTER scripts */
 
-select r2.[db_name],
-       r2.[table_name], 
-	   r2.[create_table],
-	   r1.[alter_table],
-	   r2.[create_index], 
-	   r2.[create_date]
-from #result2 r2 
-left join #result1 r1 
+SELECT r2.[db_name],
+       r2.[table_name],
+       r2.[create_table],
+       r1.[alter_table],
+       r2.[create_index],
+       r2.[create_date]
+
+FROM #result2 r2
+LEFT JOIN #result1 r1
    on r2.table_name = r1.table_name
 order by r1.create_date
 '
-insert into #tmp
+INSERT into #tmp
 exec (@tsql);
 
 END TRY
@@ -455,12 +549,9 @@ END TRY
 CLOSE db_cursor;
 DEALLOCATE db_cursor;
 
-select * from #tmp
+SELECT * FROM #tmp
 where  @Database IS NULL or [db_name] = @Database
 order by [db_name], create_date
 
 END
-
 GO
-
-
